@@ -1,8 +1,8 @@
 use crate::token::{Float, Integer, Location, PreprocessorError, Punct};
-use std::{iter::Peekable, str::Chars};
+use std::str::Chars;
 use unicode_xid::UnicodeXID;
 
-type CharAndLocation = (char, Location);
+type CharAndLine = (char, u32);
 
 // GLSL ES 3.20 specification section 3.10. Logical Phases of Compilation
 // This iterator implements phases 4 and 5 of the logical phases of compilation:
@@ -17,53 +17,73 @@ type CharAndLocation = (char, Location);
 //
 // It expects that phases 1 to 3 are already done and that valid utf8 is passed in.
 #[derive(Clone)]
-pub struct CharsAndLocation<'a> {
-    chars: Peekable<Chars<'a>>,
-    loc: Location,
+pub struct CharsAndLine<'a> {
+    input: &'a str,
+    chars: Chars<'a>,
+    peek: Option<char>,
+    line: u32,
 }
 
-impl<'a> CharsAndLocation<'a> {
+impl<'a> CharsAndLine<'a> {
     pub fn new(input: &'a str) -> Self {
-        CharsAndLocation {
-            chars: input.chars().peekable(),
-            loc: Location::default(),
+        CharsAndLine {
+            input,
+            chars: input.chars(),
+            peek: None,
+            line: 1,
         }
+    }
+
+    fn next_char(&mut self) -> Option<char> {
+        self.peek.take().or_else(|| self.chars.next())
+    }
+
+    fn peek_char(&mut self) -> Option<&char> {
+        if self.peek.is_none() {
+            self.peek = self.chars.next();
+        }
+
+        self.peek.as_ref()
+    }
+
+    fn next_if(&mut self, c: &char) {
+        if self.peek_char() == Some(c) {
+            self.next_char();
+        }
+    }
+
+    fn byte_idx(&self) -> u32 {
+        let self_beg = self.input.as_ptr() as usize;
+        let inner = self.chars.as_str().as_ptr() as usize - self.peek.map_or(0, char::len_utf8);
+        assert!(!(inner < self_beg || inner > self_beg.wrapping_add(self.input.len())));
+        inner.wrapping_sub(self_beg) as u32
     }
 }
 
-impl<'a> Iterator for CharsAndLocation<'a> {
-    type Item = CharAndLocation;
+impl<'a> Iterator for CharsAndLine<'a> {
+    type Item = CharAndLine;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.chars.next()?;
-        self.loc.start = self.loc.end;
-        self.loc.end += current.len_utf8() as u32;
+        let current = self.next_char()?;
 
         match current {
             '\n' => {
                 // Consume the token but see if we can grab a \r that follows
-                if self.chars.peek() == Some(&'\r') {
-                    self.chars.next();
-                    self.loc.end += 1;
-                }
+                self.next_if(&'\r');
 
-                let res = Some(('\n', self.loc));
-                self.loc.line += 1;
+                let res = Some(('\n', self.line));
+                self.line += 1;
                 res
             }
             '\r' => {
                 // Consume the token but see if we can grab a \n that follows
-                if self.chars.peek() == Some(&'\n') {
-                    self.chars.next();
-                    self.loc.end += 1;
-                }
+                self.next_if(&'\n');
 
-                let res = Some(('\n', self.loc));
-                self.loc.line += 1;
+                let res = Some(('\n', self.line));
+                self.line += 1;
                 res
             }
-
-            _ => Some((current, self.loc)),
+            _ => Some((current, self.line)),
         }
     }
 }
@@ -76,19 +96,19 @@ impl<'a> Iterator for CharsAndLocation<'a> {
 //     are not removed.
 #[derive(Clone)]
 pub struct SkipBackslashNewline<'a> {
-    inner: CharsAndLocation<'a>,
+    inner: CharsAndLine<'a>,
 }
 
 impl<'a> SkipBackslashNewline<'a> {
     pub fn new(input: &'a str) -> Self {
         SkipBackslashNewline {
-            inner: CharsAndLocation::new(input),
+            inner: CharsAndLine::new(input),
         }
     }
 }
 
 impl<'a> Iterator for SkipBackslashNewline<'a> {
-    type Item = CharAndLocation;
+    type Item = CharAndLine;
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut current = self.inner.next()?;
@@ -116,6 +136,7 @@ impl<'a> Iterator for SkipBackslashNewline<'a> {
 #[derive(Clone)]
 pub struct ReplaceComments<'a> {
     inner: SkipBackslashNewline<'a>,
+    peek: Option<CharAndLine>,
 }
 
 // The lexer wants to know when whitespace is a comment to know if a comment was ever processed.
@@ -127,63 +148,71 @@ impl<'a> ReplaceComments<'a> {
     pub fn new(input: &'a str) -> Self {
         ReplaceComments {
             inner: SkipBackslashNewline::new(input),
+            peek: None,
         }
+    }
+
+    fn peek(&mut self) -> Option<&CharAndLine> {
+        if self.peek.is_none() {
+            self.peek = self.next();
+        }
+
+        self.peek.as_ref()
+    }
+
+    fn byte_idx(&self) -> u32 {
+        self.inner.inner.byte_idx() - self.peek.map_or(0, |c| c.0.len_utf8() as u32)
     }
 }
 
 impl<'a> Iterator for ReplaceComments<'a> {
-    type Item = CharAndLocation;
+    type Item = CharAndLine;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut current = self.inner.next()?;
+        self.peek.take().or_else(|| {
+            let current = self.inner.next()?;
 
-        if current.0 != '/' {
-            debug_assert!(current.0 != COMMENT_SENTINEL_VALUE);
-            return Some(current);
-        }
-
-        let mut save_point = self.inner.clone();
-        match self.next() {
-            // The // case, consume until but not including the next \n
-            Some(('/', _)) => {
-                current.1.end += 1;
-
-                save_point = self.inner.clone();
-                while let Some((next, loc)) = self.inner.next() {
-                    if next == '\n' {
-                        current.1.end = loc.start;
-                        break;
-                    }
-                    current.1.end = loc.end;
-                    save_point = self.inner.clone()
-                }
-                self.inner = save_point;
-
-                Some((COMMENT_SENTINEL_VALUE, current.1))
+            if current.0 != '/' {
+                debug_assert!(current.0 != COMMENT_SENTINEL_VALUE);
+                return Some(current);
             }
 
-            // The /* case, consume until the next */
-            Some(('*', _)) => {
-                current.1.end += 1;
-
-                let mut was_star = false;
-                while let Some((next, loc)) = self.inner.next() {
-                    current.1.end = loc.end;
-                    if was_star && next == '/' {
-                        break;
+            let mut save_point = self.inner.clone();
+            match self.next() {
+                // The // case, consume until but not including the next \n
+                Some(('/', _)) => {
+                    save_point = self.inner.clone();
+                    while let Some((next, _)) = self.inner.next() {
+                        if next == '\n' {
+                            break;
+                        }
+                        save_point = self.inner.clone()
                     }
-                    was_star = next == '*';
+                    self.inner = save_point;
+
+                    Some((COMMENT_SENTINEL_VALUE, current.1))
                 }
 
-                Some((COMMENT_SENTINEL_VALUE, current.1))
-            }
+                // The /* case, consume until the next */
+                Some(('*', _)) => {
+                    let mut was_star = false;
+                    while let Some((next, _)) = self.inner.next() {
+                        if was_star && next == '/' {
+                            break;
+                        }
+                        was_star = next == '*';
+                    }
 
-            // Not // or /*, do nothing
-            _ => {
-                self.inner = save_point;
-                Some(current)
+                    Some((COMMENT_SENTINEL_VALUE, current.1))
+                }
+
+                // Not // or /*, do nothing
+                _ => {
+                    self.inner = save_point;
+                    Some(current)
+                }
             }
-        }
+        })
     }
 }
 
@@ -221,10 +250,10 @@ pub struct Token {
 
 pub type LexerItem = Result<Token, (PreprocessorError, Location)>;
 pub struct Lexer<'a> {
-    inner: Peekable<ReplaceComments<'a>>,
+    inner: ReplaceComments<'a>,
     leading_whitespace: bool,
     start_of_line: bool,
-    last_location: Location,
+    last_line: u32,
     had_comments: bool,
 }
 
@@ -232,12 +261,20 @@ impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         // TODO bail out on source that is too large.
         Lexer {
-            inner: ReplaceComments::new(input).peekable(),
+            inner: ReplaceComments::new(input),
             leading_whitespace: true,
             start_of_line: true,
-            last_location: Location::default(),
+            last_line: 1,
             had_comments: false,
         }
+    }
+
+    fn next_char(&mut self) -> Option<CharAndLine> {
+        let res = self.inner.next();
+        if let Some((_, line)) = res {
+            self.last_line = line;
+        }
+        res
     }
 
     pub fn had_comments(&self) -> bool {
@@ -254,7 +291,7 @@ impl<'a> Lexer<'a> {
             .peek()
             .map_or(false, |c| c.0.is_xid_start() || c.0 == '_')
         {
-            identifier.push(self.inner.next().unwrap().0);
+            identifier.push(self.next_char().unwrap().0);
         }
 
         let rest = self.consume_chars(|c| c.is_xid_continue());
@@ -266,9 +303,8 @@ impl<'a> Lexer<'a> {
 
     fn parse_integer_signedness_suffix(&mut self) -> bool {
         match self.inner.peek() {
-            Some(&('u', loc)) | Some(&('U', loc)) => {
-                self.inner.next();
-                self.last_location.end = loc.end;
+            Some(&('u', _)) | Some(&('U', _)) => {
+                self.next_char();
                 false
             }
             _ => true,
@@ -287,9 +323,8 @@ impl<'a> Lexer<'a> {
         match self.inner.peek() {
             Some(('l', _)) | Some(('L', _)) => Err(PreprocessorError::NotSupported64BitLiteral),
             Some(('h', _)) | Some(('H', _)) => Err(PreprocessorError::NotSupported16BitLiteral),
-            Some(&('f', loc)) | Some(&('F', loc)) => {
-                self.inner.next();
-                self.last_location.end = loc.end;
+            Some(&('f', _)) | Some(&('F', _)) => {
+                self.next_char();
                 Ok(32)
             }
             _ => Ok(32),
@@ -299,10 +334,9 @@ impl<'a> Lexer<'a> {
     fn consume_chars(&mut self, filter: impl Fn(char) -> bool) -> String {
         let mut result: String = Default::default();
 
-        while let Some(&(current, loc)) = self.inner.peek() {
+        while let Some(&(current, _)) = self.inner.peek() {
             if filter(current) {
-                self.inner.next();
-                self.last_location.end = loc.end;
+                self.next_char();
                 result.push(current);
             } else {
                 break;
@@ -321,9 +355,8 @@ impl<'a> Lexer<'a> {
         // Handle hexadecimal numbers that needs to consume a..f in addition to digits.
         if first_char == '0' {
             match self.inner.peek() {
-                Some(&('x', loc)) | Some(&('X', loc)) => {
-                    self.inner.next();
-                    self.last_location.end = loc.end;
+                Some(&('x', _)) | Some(&('X', _)) => {
+                    self.next_char();
 
                     raw += &self.consume_chars(|c| matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F'));
                     integer_radix = 16;
@@ -345,9 +378,8 @@ impl<'a> Lexer<'a> {
             // Parse any digits at the end of integers, or for the non-fractional part of floats.
             raw += &self.consume_chars(|c| ('0'..='9').contains(&c));
 
-            if let Some(&('.', loc)) = self.inner.peek() {
-                self.inner.next();
-                self.last_location.end = loc.end;
+            if let Some(&('.', _)) = self.inner.peek() {
+                self.next_char();
                 raw.push('.');
                 is_float = true;
             }
@@ -483,13 +515,12 @@ impl<'a> Lexer<'a> {
         if let Some((punct, size)) = maybe_punct {
             self.inner = save_point;
             for _ in 0..size {
-                self.inner.next();
+                self.next_char();
             }
-            self.last_location.end += size - 1;
             Ok(punct.into())
         } else if char0 == '#' {
             self.inner = save_point;
-            self.inner.next();
+            self.next_char();
             Ok(TokenValue::Hash)
         } else {
             Err(PreprocessorError::UnexpectedCharacter)
@@ -501,14 +532,16 @@ impl<'a> Iterator for Lexer<'a> {
     type Item = LexerItem;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(&(current_char, current_loc)) = self.inner.peek() {
+        let mut loc = Location::default();
+
+        while let Some(&(current_char, _)) = self.inner.peek() {
             let had_leading_whitespace = self.leading_whitespace;
             self.leading_whitespace = false;
 
             let was_start_of_line = self.start_of_line;
             self.start_of_line = false;
 
-            self.last_location = current_loc;
+            loc.start = self.inner.byte_idx();
 
             let value = match current_char {
                 ' ' | '\t' | '\x0b' | '\x0c' | COMMENT_SENTINEL_VALUE => {
@@ -517,24 +550,24 @@ impl<'a> Iterator for Lexer<'a> {
                     }
                     self.start_of_line = was_start_of_line;
                     self.leading_whitespace = true;
-                    self.inner.next();
+                    self.next_char();
                     continue;
                 }
                 '\n' => {
                     self.leading_whitespace = true;
                     self.start_of_line = true;
-                    self.inner.next();
+                    self.next_char();
                     Ok(TokenValue::NewLine)
                 }
 
                 c @ '0'..='9' => {
-                    self.inner.next();
+                    self.next_char();
                     self.parse_number(c)
                 }
 
                 // Special case . as a punctuation because it can be the start of a float.
                 '.' => {
-                    self.inner.next();
+                    self.next_char();
 
                     match self.inner.peek() {
                         Some(('0'..='9', _)) => self.parse_number('.'),
@@ -551,9 +584,13 @@ impl<'a> Iterator for Lexer<'a> {
                 }
             };
 
-            return Some(value.map_err(|e| (e, current_loc)).map(|t| Token {
+            loc.line = self.last_line;
+            loc.end = self.inner.byte_idx();
+            dbg!(loc.end);
+
+            return Some(value.map_err(|e| (e, loc)).map(|t| Token {
                 value: t,
-                location: self.last_location,
+                location: loc,
                 leading_whitespace: had_leading_whitespace,
                 start_of_line: was_start_of_line,
             }));
@@ -562,11 +599,13 @@ impl<'a> Iterator for Lexer<'a> {
         // Do the C hack of always ending with a newline so that preprocessor directives are ended.
         if !self.start_of_line {
             self.start_of_line = true;
-            self.last_location.start = self.last_location.end;
+            loc.line = self.last_line;
+            loc.start = self.inner.byte_idx();
+            loc.end = loc.start;
 
             Some(Ok(Token {
                 value: TokenValue::NewLine,
-                location: self.last_location,
+                location: loc,
                 leading_whitespace: self.leading_whitespace,
                 start_of_line: false,
             }))
